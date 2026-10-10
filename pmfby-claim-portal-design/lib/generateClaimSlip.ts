@@ -26,11 +26,28 @@ export interface ClaimResult {
   summary_hi: string
 }
 
+export interface AuditCheck {
+  name: string
+  status: 'pass' | 'warn' | 'fail'
+  detail: string
+}
+
+/** Verdict returned by /api/cline-audit. */
 export interface AuditResult {
   audit_passed: boolean
   compliance_score: string
   agent_stamp: string
   audit_log: string
+  checks?: AuditCheck[]
+  audited_at?: string
+}
+
+/** Full response of /api/process-claim. */
+export interface ProcessClaimResponse extends ClaimResult {
+  gps: Gps
+  gps_source: 'exif' | 'fallback'
+  photo_taken_at: string | null
+  model: string
 }
 
 export interface Gps {
@@ -99,6 +116,117 @@ function pickFont(text: string): string {
   return 'helvetica'
 }
 
+/* ---------------------------------------------- Indic shaping via <canvas> */
+/*
+ * jsPDF writes glyphs one by one and does NOT apply OpenType shaping, so
+ * Devanagari comes out wrong ("किसान" renders as "कसिान", conjuncts show a halant).
+ * In the browser we draw Indic text onto a canvas (the browser shapes it
+ * correctly) and embed it as a high-resolution PNG. In non-browser
+ * environments we fall back to doc.text().
+ */
+
+const CANVAS_FONT_STACK = '"PMFBY Noto Devanagari", "PMFBY Noto Telugu", sans-serif'
+const PX_PER_MM = 12 // ~300 dpi
+let canvasFontsReady: Promise<boolean> | null = null
+
+/** Any Indic script that needs complex shaping (Devanagari ... Malayalam). */
+function needsShaping(text: string): boolean {
+  return /[\u0900-\u0DFF]/.test(text)
+}
+
+/** Load the Noto fonts into the page so canvas text uses them. */
+function ensureCanvasFonts(): Promise<boolean> {
+  if (typeof document === 'undefined' || typeof FontFace === 'undefined') return Promise.resolve(false)
+  canvasFontsReady ??= (async () => {
+    try {
+      const faces = [
+        new FontFace('PMFBY Noto Devanagari', `url(/fonts/${FONT_DEVANAGARI})`),
+        new FontFace('PMFBY Noto Telugu', `url(/fonts/${FONT_TELUGU})`),
+      ]
+      await Promise.all(faces.map((f) => f.load()))
+      faces.forEach((f) => document.fonts.add(f))
+      return true
+    } catch {
+      return false
+    }
+  })()
+  return canvasFontsReady
+}
+
+/** Greedy word wrap using a measuring function. */
+function wrapWords(text: string, maxWidth: number, measure: (s: string) => number): string[] {
+  const lines: string[] = []
+  let current = ''
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const candidate = current ? `${current} ${word}` : word
+    if (current && measure(candidate) > maxWidth) {
+      lines.push(current)
+      current = word
+    } else {
+      current = candidate
+    }
+  }
+  if (current) lines.push(current)
+  return lines
+}
+
+/** Trim a list of lines to `maxLines`, adding an ellipsis when cut. */
+function clampLines(lines: string[], maxLines: number): string[] {
+  if (lines.length <= maxLines) return lines
+  const kept = lines.slice(0, maxLines)
+  kept[maxLines - 1] = `${kept[maxLines - 1].replace(/[\s.,;:]+$/, '')} ...`
+  return kept
+}
+
+/**
+ * Draw shaped text as an image. `y` is the first baseline (same contract as
+ * doc.text). Returns the y after the last line.
+ */
+function drawShapedText(
+  doc: jsPDF,
+  text: string,
+  x: number,
+  y: number,
+  o: { width: number; size: number; lineHeight: number; color: [number, number, number]; align?: 'left' | 'center'; maxLines?: number },
+): number {
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas 2D is unavailable')
+  const fontPx = o.size * 0.3528 * PX_PER_MM // pt -> mm -> px
+  const font = `${fontPx}px ${CANVAS_FONT_STACK}`
+  ctx.font = font
+  const maxW = o.width * PX_PER_MM
+  const lines = clampLines(wrapWords(text, maxW, (s) => ctx.measureText(s).width), o.maxLines ?? Infinity)
+  const lineH = o.lineHeight * PX_PER_MM
+  const top = fontPx * 1.15 // room for matras above the headline
+  canvas.width = Math.ceil(maxW)
+  canvas.height = Math.ceil(top + (lines.length - 1) * lineH + fontPx * 0.5)
+  ctx.font = font // resizing resets the context
+  ctx.fillStyle = `rgb(${o.color.join(',')})`
+  ctx.textAlign = o.align === 'center' ? 'center' : 'left'
+  ctx.textBaseline = 'alphabetic'
+  lines.forEach((line, i) => ctx.fillText(line, o.align === 'center' ? maxW / 2 : 0, top + i * lineH))
+  const left = o.align === 'center' ? x - o.width / 2 : x
+  doc.addImage(canvas.toDataURL('image/png'), 'PNG', left, y - top / PX_PER_MM, canvas.width / PX_PER_MM, canvas.height / PX_PER_MM)
+  return y + lines.length * o.lineHeight
+}
+
+/** Whether the current generation run can shape Indic text on a canvas. */
+let shapingEnabled = false
+
+/**
+ * jsPDF's built-in Helvetica only covers WinAnsi, so anything outside it
+ * (e.g. ✓ or emoji) breaks the string. Map common punctuation, drop the rest.
+ */
+function pdfSafe(text: string): string {
+  return text
+    .replace(/[\u2018\u2019\u201A\u2032]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u2033]/g, '"')
+    .replace(/[\u2013\u2014\u2212]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF]/g, '')
+}
+
 function makeClaimId(): string {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
@@ -150,10 +278,17 @@ function drawWrapped(
     color?: [number, number, number]
     width?: number
     x?: number
+    maxLines?: number
   } = {},
 ): number {
-  const { font = 'helvetica', size = 9, lineHeight = 4.2, color = INK, width = CONTENT_W, x = MARGIN } = opts
-  const lines = doc.splitTextToSize(text, width)
+  const { font = 'helvetica', size = 9, lineHeight = 4.2, color = INK, width = CONTENT_W, x = MARGIN, maxLines = Infinity } = opts
+  if (shapingEnabled && needsShaping(text)) {
+    return drawShapedText(doc, text, x, y, { width, size, lineHeight, color, maxLines })
+  }
+  const safe = font === 'helvetica' ? pdfSafe(text) : text
+  doc.setFont(font, 'normal')
+  doc.setFontSize(size)
+  const lines = clampLines(doc.splitTextToSize(safe, width) as string[], maxLines)
   doc.setFont(font, 'normal')
   doc.setFontSize(size)
   doc.setTextColor(...color)
@@ -185,15 +320,20 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(7.5)
   doc.text(
-    'Government of India  ·  Pradhan Mantri Fasal Bima Yojana  ·  Emergency Calamity Claim',
+    'Pradhan Mantri Fasal Bima Yojana  ·  Emergency Calamity Claim  ·  AI-assisted pre-assessment',
     PAGE_W / 2,
     18.5,
     { align: 'center' },
   )
-  // Devanagari tagline rendered with the registered Noto font.
-  doc.setFont('NotoDevanagari', 'normal')
-  doc.setFontSize(8)
-  doc.text('किसान आपत्ति दावा पत्र', PAGE_W / 2, 23.5, { align: 'center' })
+  // Devanagari tagline ("Farmer calamity claim form"), shaped when possible.
+  const tagline = 'किसान आपदा दावा पत्र'
+  if (shapingEnabled) {
+    drawShapedText(doc, tagline, PAGE_W / 2, 23.5, { width: 80, size: 8, lineHeight: 4, color: [255, 255, 255], align: 'center' })
+  } else {
+    doc.setFont('NotoDevanagari', 'normal')
+    doc.setFontSize(8)
+    doc.text(tagline, PAGE_W / 2, 23.5, { align: 'center' })
+  }
 
   let y = 36
 
@@ -237,10 +377,11 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
 
   fieldLabel(doc, y, 'Original (vernacular)')
   y += 4
-  y = drawWrapped(doc, y, `“${claim.transcript}”`, {
+  y = drawWrapped(doc, y, claim.transcript ? `“${claim.transcript}”` : '(No speech detected in the recording)', {
     font: pickFont(claim.transcript),
     size: 9,
     lineHeight: 4.3,
+    maxLines: 4,
   })
   y += 2
 
@@ -256,6 +397,7 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
     size: 9,
     lineHeight: 4.2,
     color: [70, 76, 72],
+    maxLines: 4,
   })
   y += 4
 
@@ -277,10 +419,11 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
     doc.setFont('helvetica', 'bold')
     doc.setFontSize(11)
     doc.setTextColor(...INK)
-    doc.text(value, tx + 4, ty + 12)
+    const fitted = clampLines(doc.splitTextToSize(pdfSafe(value), tileW - 8) as string[], 1)[0] ?? ''
+    doc.text(fitted, tx + 4, ty + 12)
   }
-  drawTile(MARGIN, y, 'Detected crop', claim.crop || '—')
-  drawTile(MARGIN + tileW + tileGap, y, 'Calamity type', claim.calamity || '—')
+  drawTile(MARGIN, y, 'Detected crop', claim.crop || '-')
+  drawTile(MARGIN + tileW + tileGap, y, 'Calamity type', claim.calamity || '-')
   drawTile(MARGIN, y + tileH + tileGap, 'Estimated damage', `${Math.round(claim.damage_pct)}%`)
   drawTile(MARGIN + tileW + tileGap, y + tileH + tileGap, 'Hours since incident', `${claim.hours_ago} hrs`)
   y += tileH * 2 + tileGap + 6
@@ -295,7 +438,7 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
     try {
       const props = doc.getImageProperties(input.imageDataUrl)
       photoH = photoW * (props.height / props.width)
-      const maxH = 58
+      const maxH = 48
       let drawW = photoW
       if (photoH > maxH) {
         photoH = maxH
@@ -345,33 +488,61 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, qrDataUrl: stri
   y += Math.max(photoH, qrSize + 14) + 6
 
 
-  /* ---- Compliance audit stamp (optional, Phase 4) ---- */
+  /* ---- Compliance audit stamp (Cline PMFBY Compliance Auditor) ---- */
   if (input.audit) {
     const a = input.audit
-    const boxH = 16
-    doc.setDrawColor(...PRIMARY)
-    doc.setLineWidth(0.4)
-    doc.setFillColor(245, 249, 246)
+    const checks = a.checks ?? []
+    const ok = a.audit_passed
+    const accent: [number, number, number] = ok ? PRIMARY : [176, 58, 46]
+    const tint: [number, number, number] = ok ? [243, 248, 244] : [252, 241, 239]
+    const headerH = 15
+    const rowH = 4.1
+    // Keep the stamp above the footer: drop check rows that would not fit.
+    const space = PAGE_H - 22 - y
+    const maxRows = Math.max(0, Math.floor((space - headerH - 4) / rowH))
+    const rows = checks.slice(0, maxRows)
+    const boxH = headerH + (rows.length ? rows.length * rowH + 2 : 1)
+
+    doc.setFillColor(...tint)
+    doc.setDrawColor(...accent)
+    doc.setLineWidth(0.5)
     doc.rect(MARGIN, y, CONTENT_W, boxH, 'FD')
+    doc.setFillColor(...accent)
+    doc.rect(MARGIN, y, 2.2, boxH, 'F')
+
     doc.setFont('helvetica', 'bold')
+    doc.setFontSize(10)
+    doc.setTextColor(...accent)
+    doc.text(ok ? 'AUDIT PASSED' : 'AUDIT FLAGGED', MARGIN + 6, y + 6)
     doc.setFontSize(9)
-    doc.setTextColor(...PRIMARY)
-    doc.text(
-      `${a.audit_passed ? '✓ VERIFIED' : '✗ NOT VERIFIED'}  ·  Compliance ${a.compliance_score}`,
-      MARGIN + 4,
-      y + 6,
-    )
-    doc.setFont('helvetica', 'bold')
+    doc.text(`Compliance score ${pdfSafe(a.compliance_score)}`, colRightX - 4, y + 6, { align: 'right' })
     doc.setFontSize(8)
     doc.setTextColor(...INK)
-    doc.text(a.agent_stamp, MARGIN + 4, y + 11.5)
-    doc.setFont('helvetica', 'normal')
-    doc.setFontSize(7)
-    doc.setTextColor(...MUTED)
-    const auditLines = doc.splitTextToSize(a.audit_log, CONTENT_W - 8)
-    // Show only the first line to preserve the single-page layout.
-    doc.text(auditLines[0] || '', MARGIN + 4, y + 15)
-    y += boxH + 6
+    doc.text(pdfSafe(a.agent_stamp), MARGIN + 6, y + 11)
+    if (a.audited_at) {
+      doc.setFont('helvetica', 'normal')
+      doc.setFontSize(6.5)
+      doc.setTextColor(...MUTED)
+      doc.text(`Audited ${formatDateTime(new Date(a.audited_at))}`, colRightX - 4, y + 11, { align: 'right' })
+    }
+
+    let ry = y + headerH + 1.5
+    for (const c of rows) {
+      const statusColor: [number, number, number] =
+        c.status === 'pass' ? PRIMARY : c.status === 'warn' ? [166, 117, 31] : [176, 58, 46]
+      doc.setFont('helvetica', 'bold')
+      doc.setFontSize(6.8)
+      doc.setTextColor(...statusColor)
+      doc.text(c.status.toUpperCase(), MARGIN + 6, ry)
+      doc.setTextColor(...INK)
+      doc.text(pdfSafe(c.name), MARGIN + 16, ry)
+      doc.setFont('helvetica', 'normal')
+      doc.setTextColor(...MUTED)
+      const detail = clampLines(doc.splitTextToSize(pdfSafe(c.detail), CONTENT_W - 44) as string[], 1)[0] ?? ''
+      doc.text(detail, MARGIN + 38, ry)
+      ry += rowH
+    }
+    y += boxH + 4
   }
 
   /* ---- Footer ---- */
@@ -419,6 +590,8 @@ export async function generateClaimSlip(
   const doc = new jsPDF({ unit: 'mm', format: 'a4' })
   const loader = opts.fontLoader ?? browserFontLoader
   await registerFonts(doc, loader)
+  // In the browser, shape Indic text on a canvas; elsewhere use doc.text().
+  shapingEnabled = !opts.fontLoader && (await ensureCanvasFonts())
 
   const gps = input.gps ?? FALLBACK_GPS
   const claimId = input.claimId || makeClaimId()
@@ -429,7 +602,8 @@ export async function generateClaimSlip(
     color: { dark: '#1b2a20', light: '#ffffff' },
   })
 
-  drawClaimSlip(doc, input, qrDataUrl)
+  // Pass the same id through so the printed id matches the one in the QR code.
+  drawClaimSlip(doc, { ...input, claimId }, qrDataUrl)
   return doc
 }
 
