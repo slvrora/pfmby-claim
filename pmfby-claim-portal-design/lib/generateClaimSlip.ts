@@ -1,18 +1,17 @@
 import type { jsPDF } from 'jspdf'
 import { normalizeAnalysis, validCoordinates } from './claimAnalysis'
 import { DRAFT_STATUS_EN, DRAFT_STATUS_HI, type ClaimAnalysis, type ClaimGps } from './types'
-import { computeSlipLayout, CONTENT_WIDTH, FOOTER_TOP, MARGIN, MEDIA_TOP, PAGE_WIDTH } from './claimSlipLayout'
+import { BODY_BOTTOM, computeSlipLayout, CONTENT_WIDTH, FOOTER_TOP, MARGIN, MEDIA_TOP, PAGE_WIDTH } from './claimSlipLayout'
 
-export interface AuditResult {
-  audit_passed: boolean
-  compliance_score: string
-  agent_stamp: string
-  audit_log: string
-}
+import { auditTone, type AuditResult, type AuditTone } from './auditTypes'
+
+export type { AuditResult }
 export interface ClaimSlipInput {
   claim: ClaimAnalysis
   imageDataUrl?: string | null
   audit?: AuditResult | null
+  /** Set when the audit endpoint failed; the PDF then shows "Audit unavailable". */
+  auditError?: string | null
   claimId?: string
 }
 export type FontLoader = (fileName: string) => Promise<string>
@@ -58,6 +57,95 @@ export function buildQrPayload(claimId: string, gps: ClaimGps, timestamp: string
 }
 
 interface FontState { devanagari: boolean; telugu: boolean }
+
+/* ------------------------------------------------ Audit Verification box */
+
+const TONE: Record<AuditTone, { accent: [number, number, number]; tint: [number, number, number] }> = {
+  green: { accent: [41, 75, 53], tint: [243, 248, 244] },
+  amber: { accent: [166, 117, 31], tint: [253, 247, 234] },
+  red: { accent: [176, 58, 46], tint: [252, 241, 239] },
+}
+const AUDIT_HEADER = 14
+const AUDIT_ROW = 3.8
+const AUDIT_NOTE = 5
+const AUDIT_MAX_ROWS = 6
+const MEDIA_HEIGHT = 42 // photo/QR block incl. the caption under the QR
+
+/** Height of the Audit Verification box, or 0 when there is nothing to show. */
+function auditBoxHeight(input: ClaimSlipInput): number {
+  if (input.audit) {
+    const rows = Math.min(AUDIT_MAX_ROWS, input.audit.checks?.length || 1)
+    return AUDIT_HEADER + rows * AUDIT_ROW + AUDIT_NOTE
+  }
+  return input.auditError !== undefined && input.auditError !== null ? AUDIT_HEADER : 0
+}
+
+function formatAuditTime(iso: string | undefined): string {
+  if (!iso || !Number.isFinite(Date.parse(iso))) return ''
+  try {
+    return new Date(iso).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) + ' IST'
+  } catch { return iso }
+}
+
+/** One line of Helvetica text that fits `width`, with '...' when cut. */
+function fitLine(doc: jsPDF, text: string, width: number): string {
+  const lines: string[] = doc.splitTextToSize(ascii(text) || '-', width)
+  if (lines.length <= 1) return lines[0] ?? ''
+  const first: string[] = doc.splitTextToSize(ascii(text), width - doc.getTextWidth('...'))
+  return `${(first[0] ?? '').trimEnd()}...`
+}
+
+function drawAuditBox(doc: jsPDF, input: ClaimSlipInput, top: number, height: number): void {
+  const right = PAGE_WIDTH - MARGIN
+  const a = input.audit
+  const tone = a ? auditTone(a) : 'amber'
+  const { accent, tint } = TONE[tone]
+  doc.setFillColor(...tint); doc.setDrawColor(...accent); doc.setLineWidth(0.5)
+  doc.rect(MARGIN, top, CONTENT_WIDTH, height, 'FD')
+  doc.setFillColor(...accent); doc.rect(MARGIN, top, 2.2, height, 'F')
+  doc.setLineWidth(0.2)
+
+  const title = !a ? 'AUDIT VERIFICATION - AUDIT UNAVAILABLE'
+    : a.audit_passed ? 'AUDIT VERIFICATION - PASSED' : 'AUDIT VERIFICATION - MANUAL REVIEW REQUIRED'
+  doc.setTextColor(...accent); doc.setFont('helvetica', 'bold'); doc.setFontSize(9)
+  doc.text(title, MARGIN + 5, top + 5.5)
+
+  if (!a) {
+    doc.setTextColor(32, 38, 33); doc.setFont('helvetica', 'normal'); doc.setFontSize(7)
+    const reason = safeText(input.auditError, '')
+    doc.text(fitLine(doc, `Audit unavailable: the compliance auditor could not be reached${reason ? ` (${reason})` : ''}. Manual review required.`, CONTENT_WIDTH - 8), MARGIN + 5, top + 10.5)
+    return
+  }
+
+  doc.text(`Compliance score ${ascii(safeText(a.compliance_score))}`, right - 3, top + 5.5, { align: 'right' })
+  doc.setTextColor(32, 38, 33); doc.setFontSize(7.5)
+  doc.text(fitLine(doc, safeText(a.agent_stamp), CONTENT_WIDTH - 60), MARGIN + 5, top + 10)
+  const when = formatAuditTime(a.audited_at)
+  if (when) {
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(6.5); doc.setTextColor(110, 118, 112)
+    doc.text(`Audited ${when}`, right - 3, top + 10, { align: 'right' })
+  }
+
+  let y = top + AUDIT_HEADER + 1
+  const checks = (a.checks ?? []).slice(0, AUDIT_MAX_ROWS)
+  if (!checks.length) {
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(6.8); doc.setTextColor(110, 118, 112)
+    doc.text(fitLine(doc, safeText(a.audit_log), CONTENT_WIDTH - 10), MARGIN + 5, y)
+    y += AUDIT_ROW
+  }
+  for (const c of checks) {
+    const color: [number, number, number] = c.status === 'pass' ? TONE.green.accent : c.status === 'warn' ? TONE.amber.accent : TONE.red.accent
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(6.8); doc.setTextColor(...color)
+    doc.text(c.status.toUpperCase(), MARGIN + 5, y)
+    doc.setTextColor(32, 38, 33)
+    doc.text(fitLine(doc, safeText(c.name), 22), MARGIN + 15, y)
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(90, 98, 92)
+    doc.text(fitLine(doc, safeText(c.detail), CONTENT_WIDTH - 42), MARGIN + 38, y)
+    y += AUDIT_ROW
+  }
+  doc.setFont('helvetica', 'italic'); doc.setFontSize(6.3); doc.setTextColor(110, 118, 112)
+  doc.text('Internal compliance pre-check by the Autonomous Cline Auditor. Not insurer approval.', MARGIN + 5, y + 0.8)
+}
 
 export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, claimId: string, timestamp: string, qrDataUrl: string | null, fonts: FontState, warnings: string[]): void {
   const claim = normalizeAnalysis(input.claim)
@@ -106,7 +194,12 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, claimId: string
     const lines: string[] = doc.splitTextToSize(text, CONTENT_WIDTH - 5)
     return { ...block, font, lines, lineHeight: 4.5 }
   })
-  const layout = computeSlipLayout(measured)
+  // With an Audit Verification box, the photo/QR block moves up to make room
+  // and the text body gets less space (computeSlipLayout truncates to fit).
+  const auditHeight = auditBoxHeight(input)
+  const auditTop = FOOTER_TOP - 2 - auditHeight
+  const mediaTop = auditHeight ? Math.min(MEDIA_TOP, auditTop - 2 - MEDIA_HEIGHT) : MEDIA_TOP
+  const layout = computeSlipLayout(measured, undefined, mediaTop - (MEDIA_TOP - BODY_BOTTOM))
   for (const block of layout) {
     const style = measured.find(item => item.key === block.key)
     doc.setFont(style?.font ?? 'helvetica', 'normal'); doc.setFontSize(9)
@@ -114,32 +207,28 @@ export function drawClaimSlip(doc: jsPDF, input: ClaimSlipInput, claimId: string
     if (block.truncated) warnings.push(`${block.key}: shortened to keep the PDF on one page.`)
   }
 
-  doc.setDrawColor(210, 216, 211); doc.rect(MARGIN, MEDIA_TOP, 60, 36)
+  doc.setDrawColor(210, 216, 211); doc.rect(MARGIN, mediaTop, 60, 36)
   let photoDrawn = false
   if (input.imageDataUrl) {
     try {
       const props = doc.getImageProperties(input.imageDataUrl)
       const scale = Math.min(60 / props.width, 36 / props.height)
       if (!Number.isFinite(scale) || scale <= 0) throw new Error('Invalid photo dimensions')
-      doc.addImage(input.imageDataUrl, props.fileType, MARGIN, MEDIA_TOP, props.width * scale, props.height * scale)
+      doc.addImage(input.imageDataUrl, props.fileType, MARGIN, mediaTop, props.width * scale, props.height * scale)
       photoDrawn = true
     } catch { warnings.push('Photo could not be embedded; keep the original photo as evidence.') }
   }
   doc.setFont('helvetica', 'normal'); doc.setFontSize(8)
-  if (!photoDrawn) doc.text('Photo not attached; keep original.', MARGIN + 2, MEDIA_TOP + 18)
+  if (!photoDrawn) doc.text('Photo not attached; keep original.', MARGIN + 2, mediaTop + 18)
   let qrDrawn = false
   if (qrDataUrl) {
-    try { doc.addImage(qrDataUrl, 'PNG', PAGE_WIDTH - MARGIN - 34, MEDIA_TOP, 34, 34); qrDrawn = true }
+    try { doc.addImage(qrDataUrl, 'PNG', PAGE_WIDTH - MARGIN - 34, mediaTop, 34, 34); qrDrawn = true }
     catch { warnings.push('QR could not be embedded. Use the printed reference.') }
   }
   doc.setFont('helvetica', 'normal'); doc.setFontSize(7)
-  doc.text(qrDrawn ? 'Draft reference only - not proof of filing' : 'QR unavailable - use printed reference', PAGE_WIDTH - MARGIN, MEDIA_TOP + 40, { align: 'right' })
-  if (input.audit) {
-    const a = input.audit
-    doc.setFont('helvetica', 'normal'); doc.setFontSize(7)
-    const lines: string[] = doc.splitTextToSize(ascii(`Internal review: ${a.audit_passed ? 'passed' : 'not passed'}; ${safeText(a.compliance_score)}; ${safeText(a.agent_stamp)}; ${safeText(a.audit_log)}. Not insurer approval.`), CONTENT_WIDTH - 5)
-    doc.text(lines.slice(0, 2), MARGIN, 263)
-  }
+  doc.text(qrDrawn ? 'Draft reference only - not proof of filing' : 'QR unavailable - use printed reference', PAGE_WIDTH - MARGIN, mediaTop + 40, { align: 'right' })
+  if (auditHeight) drawAuditBox(doc, input, auditTop, auditHeight)
+  doc.setTextColor(32, 38, 33); doc.setDrawColor(210, 216, 211)
   doc.line(MARGIN, FOOTER_TOP, PAGE_WIDTH - MARGIN, FOOTER_TOP)
   doc.setFont('helvetica', 'normal'); doc.setFontSize(7)
   doc.text('Submit through your insurer or the official PMFBY portal: https://pmfby.gov.in', MARGIN, 280)

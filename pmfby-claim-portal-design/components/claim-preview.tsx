@@ -12,10 +12,19 @@ import { DRAFT_STATUS_EN, DRAFT_STATUS_HI, FILING_CONTACT_TODO, FILING_NEXT_STEP
 import { AuditBadge } from '@/components/audit-badge'
 import type { AuditState, AuditVerdict } from '@/lib/auditTypes'
 
+// The audit route may retry Gemini across fallback models; cap the wait so
+// the Download button is never blocked for long. On timeout: "Audit unavailable".
+const AUDIT_TIMEOUT_MS = 30_000
+
 /** Run the Cline PMFBY Compliance Auditor on a finished draft analysis. */
 async function runAudit(analysis: ClaimAnalysis, signal: AbortSignal): Promise<AuditVerdict> {
+  const timeout = AbortSignal.timeout(AUDIT_TIMEOUT_MS)
   const response = await fetch('/api/cline-audit', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(analysis), signal,
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(analysis),
+    signal: AbortSignal.any([signal, timeout]),
+  }).catch((cause: unknown) => {
+    if (timeout.aborted && !signal.aborted) throw new Error('auditor timed out')
+    throw cause
   })
   const data: unknown = await response.json().catch(() => null)
   if (!response.ok || !isRecord(data) || typeof data.audit_passed !== 'boolean' || !Array.isArray(data.checks)) {
@@ -72,7 +81,11 @@ export function ClaimPreview({ coords, photos, audio, language, incident }: Prop
     setAudit('loading')
     runAudit(analysis, controller.signal)
       .then(verdict => { if (!controller.signal.aborted) setAudit(verdict) })
-      .catch(cause => { if (!controller.signal.aborted) setAudit({ error: cause instanceof Error ? cause.message : 'Audit failed' }) })
+      .catch(cause => {
+        if (controller.signal.aborted) return
+        const msg = cause instanceof Error ? cause.message : ''
+        setAudit({ error: /fetch|network/i.test(msg) || !msg ? 'network error' : msg })
+      })
     return () => controller.abort()
   }, [analysis])
 
@@ -124,7 +137,8 @@ export function ClaimPreview({ coords, photos, audio, language, incident }: Prop
         try { imageDataUrl = await toDataUrl(photos[0].file) } catch { photoWarning = 'The photo could not be attached. Keep the original as evidence. ' }
       }
       const verdict = audit && audit !== 'loading' && !('error' in audit) ? audit : null
-      const result = await generateClaimSlip({ claim: analysis, imageDataUrl, audit: verdict })
+      const auditError = audit && audit !== 'loading' && 'error' in audit ? audit.error : null
+      const result = await generateClaimSlip({ claim: analysis, imageDataUrl, audit: verdict, auditError })
       if (revision.current !== currentRevision) return
       result.doc.save('Kisan-Claim-Slip-72A.pdf')
       setMessage(photoWarning + 'Draft PDF download requested. ' + DRAFT_STATUS_EN + ' ' + result.warnings.join(' '))
@@ -132,7 +146,8 @@ export function ClaimPreview({ coords, photos, audio, language, incident }: Prop
     finally { downloading.current = false; setGenerating(false) }
   }
 
-  return <Card className="preview-card [--card-spacing:--spacing(6)]">
+  // The audit badge sits directly below the preview card (same grid column).
+  return <div className="flex flex-col gap-4"><Card className="preview-card [--card-spacing:--spacing(6)]">
     <CardHeader><div className="mb-3 flex items-center justify-between"><span className="step-label">STEP 03</span><Badge variant="secondary"><Sparkles data-icon="inline-start" />Draft preview</Badge></div><CardTitle><h2>Your claim, made clear.</h2></CardTitle><CardDescription>A draft to review before contacting your insurer.</CardDescription></CardHeader>
     <CardContent className="flex flex-col gap-5">
       <p className="text-xs text-muted-foreground">Preparing a draft sends your recording and the first photo to Google Gemini for analysis. Audio + photo: under 4 MB combined. Additional photos stay in this session; keep them for your insurer.</p>
@@ -154,12 +169,13 @@ export function ClaimPreview({ coords, photos, audio, language, incident }: Prop
           {notice && <p role="status" className="text-xs">{notice}</p>}
           {usedFallback && <p role="status" className="text-xs">Playing the English summary instead.</p>}
         </div>
-        <AuditBadge audit={audit} />
         <div className="flex gap-2 text-xs leading-5"><Info className="size-4 shrink-0" /><p>AI-assisted draft only. Your insurer must verify the actual loss. {FILING_NEXT_STEP} {FILING_CONTACT_TODO && `Verified contact: ${FILING_CONTACT_TODO}`}</p></div>
         <p lang="hi" className="text-xs">यह मसौदा अपनी बीमा कंपनी या आधिकारिक PMFBY पोर्टल पर जमा करें।</p>
-        <Button className="h-12 w-full" onClick={download} disabled={generating || audit === 'loading'}>{generating || audit === 'loading' ? <Loader2 className="animate-spin" /> : <Download />}{generating ? 'Generating PDF…' : audit === 'loading' ? 'Waiting for compliance audit…' : 'Download draft claim slip'}</Button>
+        <Button className="h-12 w-full" onClick={download} disabled={generating || audit === 'loading'}>{generating || audit === 'loading' ? <Loader2 className="animate-spin" /> : <Download />}{generating ? 'Generating PDF…' : audit === 'loading' ? 'Auditor reviewing…' : 'Download draft claim slip'}</Button>
       </>}
       {message && <p role="status" className="text-xs leading-5 text-primary">{message}</p>}
     </CardContent>
   </Card>
+  {analysis && <AuditBadge audit={audit} />}
+  </div>
 }
