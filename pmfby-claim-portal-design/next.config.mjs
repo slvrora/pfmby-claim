@@ -1,8 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  typescript: {
-    ignoreBuildErrors: true,
-  },
+  // Keep EXIF's Node fs/zlib imports intact instead of bundling its UMD loader.
+  serverExternalPackages: ['exifr'],
   images: {
     unoptimized: true,
   },

@@ -7,14 +7,14 @@
 
 import type { ContentListUnion, GenerateContentConfig, GenerateContentResponse, GoogleGenAI } from '@google/genai'
 
-// gemini-1.5 / 2.5 Flash are no longer available to new API keys; override via GEMINI_MODEL.
-export const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash'
+// Same default as /api/process-claim (slvrora verified gemini-3.6-flash); override via GEMINI_MODEL.
+export const GEMINI_MODEL = process.env.GEMINI_MODEL?.trim() || 'gemini-3.6-flash'
 
 /**
  * Models tried, in order, when the primary model is overloaded (503) or
  * rate-limited (429). Override with a comma-separated GEMINI_FALLBACK_MODELS.
  */
-const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS ?? 'gemini-flash-latest,gemini-3-flash-preview')
+const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS ?? 'gemini-3.5-flash,gemini-flash-latest')
   .split(',')
   .map((m) => m.trim())
   .filter(Boolean)

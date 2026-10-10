@@ -30,13 +30,29 @@ interface AuditCheck {
   detail: string
 }
 
+/**
+ * Accepts the ClaimAnalysis shape from /api/process-claim (lib/types.ts):
+ * crop_type, damage_cause, hours_elapsed, transcript_en, damage_pct,
+ * gps { lat, lng, source, label }, warnings. The older names (crop, calamity,
+ * hours_ago, translation) are still accepted as aliases.
+ */
 interface ClaimInput {
+  transcript_en?: unknown
+  crop_type?: unknown
+  damage_cause?: unknown
+  hours_elapsed?: unknown
   translation?: unknown
   crop?: unknown
   calamity?: unknown
-  damage_pct?: unknown
   hours_ago?: unknown
+  damage_pct?: unknown
   gps?: unknown
+  warnings?: unknown
+}
+
+/** True when normalizeAnalysis() flagged this field as unknown (0 is a placeholder). */
+function flaggedUnknown(warnings: unknown, field: string): boolean {
+  return Array.isArray(warnings) && warnings.some((w) => typeof w === 'string' && w.startsWith(`${field}:`) && /unknown|unavailable/i.test(w))
 }
 
 /**
@@ -88,19 +104,21 @@ function checkCalamity(calamity: unknown): AuditCheck {
 }
 
 function checkGps(gps: unknown): AuditCheck {
-  const g = gps as { lat?: unknown; lng?: unknown } | null | undefined
+  const g = gps as { lat?: unknown; lng?: unknown; source?: unknown } | null | undefined
   const lat = g?.lat
   const lng = g?.lng
   if (!isNum(lat) || !isNum(lng)) {
-    return { name: 'GPS', status: 'fail', detail: 'GPS coordinates not provided.' }
+    return { name: 'GPS', status: 'fail', detail: 'GPS coordinates not available. Share your field location in Step 2.' }
   }
   if (Math.abs(lat) > 90 || Math.abs(lng) > 180) {
     return { name: 'GPS', status: 'fail', detail: `GPS coordinates out of range (${lat}, ${lng}).` }
   }
   const pin = `${lat.toFixed(5)}, ${lng.toFixed(5)}`
-  return isFallbackLocation(lat, lng)
-    ? { name: 'GPS', status: 'warn', detail: `Fallback location used (${pin}, demo village Wardha). The field location must be confirmed on site.` }
-    : { name: 'GPS', status: 'pass', detail: `Field geotagged at ${pin}.` }
+  if (g?.source === 'fallback' || isFallbackLocation(lat, lng)) {
+    return { name: 'GPS', status: 'warn', detail: `Fallback location used (${pin}, approximate). The field location must be confirmed on site.` }
+  }
+  const from = g?.source === 'exif' ? 'photo EXIF' : g?.source === 'device' ? 'device location' : 'coordinates'
+  return { name: 'GPS', status: 'pass', detail: `Field geotagged at ${pin} (${from}).` }
 }
 
 /* ------------------------------------------- Gemini consistency (2nd call) */
@@ -200,14 +218,26 @@ export async function POST(req: Request) {
   const raw = body as ClaimInput & { claim?: ClaimInput }
   const claim: ClaimInput = { ...(raw.claim ?? {}), ...raw }
   const gps = raw.gps ?? raw.claim?.gps
+  const hours = claim.hours_elapsed ?? claim.hours_ago
+  const crop = claim.crop_type ?? claim.crop
+  const calamity = claim.damage_cause ?? claim.calamity
+  const translation = claim.transcript_en ?? claim.translation
 
   // Checks run in sequence, and each one becomes an audit_log step.
   const checks: AuditCheck[] = []
-  checks.push(checkWindow(claim.hours_ago))
-  checks.push(checkCrop(claim.crop))
-  checks.push(checkCalamity(claim.calamity))
+  checks.push(
+    flaggedUnknown(claim.warnings, 'hours_elapsed')
+      ? { name: 'WINDOW', status: 'warn', detail: 'Incident time was not stated in the recording, so the 72-hr window could not be checked.' }
+      : checkWindow(hours),
+  )
+  checks.push(checkCrop(crop === 'N/A' ? undefined : crop))
+  checks.push(checkCalamity(calamity === 'N/A' ? undefined : calamity))
   checks.push(checkGps(gps))
-  checks.push(await checkConsistency(claim.translation, claim.damage_pct))
+  checks.push(
+    flaggedUnknown(claim.warnings, 'damage_pct')
+      ? { name: 'CONSISTENCY', status: 'warn', detail: 'Damage percentage is unknown, so severity consistency could not be checked.' }
+      : await checkConsistency(translation === 'N/A' ? undefined : translation, claim.damage_pct),
+  )
 
   const auditPassed = checks.every((c) => c.status !== 'fail')
   const score = computeScore(checks)

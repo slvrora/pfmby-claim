@@ -1,8 +1,7 @@
 "use client"
 
 import { ShieldCheck, ShieldAlert, Loader2, CircleCheck, TriangleAlert, CircleX } from 'lucide-react'
-import type { AuditCheck } from '@/lib/generateClaimSlip'
-import type { AuditState } from '@/components/claim-portal'
+import type { AuditCheck, AuditState } from '@/lib/auditTypes'
 
 const STATUS_UI: Record<AuditCheck['status'], { icon: typeof CircleCheck; color: string; label: string }> = {
   pass: { icon: CircleCheck, color: 'text-[#4f7a45]', label: 'Pass' },
@@ -27,7 +26,7 @@ export function AuditBadge({ audit }: { audit: AuditState }) {
     return (
       <div role="status" className="flex items-start gap-3 rounded-lg border border-[#e8d9b7] bg-[#fbf8f0] p-3 text-xs leading-5 text-[#7a5a1f]">
         <TriangleAlert className="mt-0.5 size-4 shrink-0" />
-        <span>Compliance audit could not be completed ({audit.error}). Your claim details are still saved in this slip.</span>
+        <span>Compliance audit could not be completed ({audit.error}). You can still download the draft slip.</span>
       </div>
     )
   }
