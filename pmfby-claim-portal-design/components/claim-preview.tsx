@@ -5,99 +5,129 @@ import { Wheat, Waves, MapPin, Sparkles, Volume2, Download, Info, FileCheck2, Sq
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { generateClaimSlip, type ClaimSlipInput } from '@/lib/generateClaimSlip'
+import { generateClaimSlip } from '@/lib/generateClaimSlip'
 import { useSpeech } from '@/lib/useSpeech'
+import { isRecord, normalizeAnalysis, validCoordinates } from '@/lib/claimAnalysis'
+import { DRAFT_STATUS_EN, DRAFT_STATUS_HI, FILING_CONTACT_TODO, FILING_NEXT_STEP, MAX_MEDIA_BYTES, type ClaimAnalysis } from '@/lib/types'
 
-const hindi = 'मेरे खेत में लगातार बारिश की वजह से पानी भर गया है। मेरी धान की फसल का बहुत नुकसान हुआ है। लगभग पूरा खेत पानी में डूबा हुआ है।'
-const english = 'My field is waterlogged due to continuous rain. My paddy crop has been badly damaged. Almost the entire field is submerged in water.'
-// Short, farmer-friendly confirmations spoken back to the farmer (matches the
-// `summary` / `summary_hi` fields produced by /api/process-claim).
-const summaryHi = 'आपका दावा दर्ज हो गया है। फसल: धान (Paddy)। नुकसान: 85 प्रतिशत। बाढ़ के कारण हुआ नुकसान 72 घंटे के भीतर दर्ज किया गया है।'
-const summaryEn = 'Your claim has been recorded. Crop: Paddy. Damage: 85 percent. The flood damage has been filed within the 72-hour window.'
-
-// Convert a blob/object URL into a base64 data URL so jsPDF can embed it.
-async function toDataUrl(url: string): Promise<string> {
-  const res = await fetch(url)
-  const blob = await res.blob()
+async function toDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
-    reader.onloadend = () => resolve(reader.result as string)
-    reader.onerror = reject
-    reader.readAsDataURL(blob)
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Photo could not be read.'))
+    reader.onerror = () => reject(new Error('Photo could not be read.'))
+    reader.onabort = () => reject(new Error('Photo reading was interrupted.'))
+    reader.readAsDataURL(file)
   })
 }
 
-export function ClaimPreview({ location, coords, photos, hasAudio, photoCount }: { location: string; coords: { lat: number; lng: number } | null; photos: { name: string; url: string }[]; hasAudio: boolean; photoCount: number }) {
-  const [message, setMessage] = useState('')
-  const [generating, setGenerating] = useState(false)
-  const { speaking, lang, hindiAvailable, usedFallback, speak, setLang } = useSpeech()
-  const autoPlayed = useRef(false)
+interface Props {
+  coords: { lat: number; lng: number } | null
+  photos: { name: string; url: string; file: File }[]
+  audio: Blob | null
+  language: string
+  incident: string
+}
 
-  // Auto-play the readback once after results load — only if the browser allows
-  // it (i.e. a usable voice is actually available). Otherwise just show buttons.
+export function ClaimPreview({ coords, photos, audio, language, incident }: Props) {
+  const [analysis, setAnalysis] = useState<ClaimAnalysis | null>(null)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [generating, setGenerating] = useState(false)
+  const pending = useRef(false)
+  const downloading = useRef(false)
+  const request = useRef<AbortController | null>(null)
+  const revision = useRef(0)
+  const { speaking, lang, hindiAvailable, usedFallback, supported, voicesReady, notice, needsTap, speak, setLang, cancel } = useSpeech()
+
   useEffect(() => {
-    if (autoPlayed.current) return
-    if (!('speechSynthesis' in window)) return
-    // Wait until the voice list has populated before deciding.
-    if (window.speechSynthesis.getVoices().length === 0) return
-    autoPlayed.current = true
-    speak({ hi: summaryHi, en: summaryEn }, 'hi')
-  }, [speak])
+    revision.current++
+    request.current?.abort()
+    setAnalysis(null); setMessage(''); setError(''); cancel()
+    return () => { revision.current++; request.current?.abort(); cancel() }
+  }, [audio, photos, coords, language, incident, cancel])
+
+  async function prepare() {
+    if (pending.current) return
+    if (!audio || !photos[0]) { setError('Record your story and add a field photo first.'); return }
+    if (audio.size + photos[0].file.size > MAX_MEDIA_BYTES) {
+      setError('The recording and first photo must total under 4 MB. Please use a smaller photo or shorter recording. Your inputs have been kept.'); return
+    }
+    pending.current = true
+    setLoading(true); setError(''); setAnalysis(null); setMessage(''); cancel()
+    const controller = new AbortController()
+    request.current = controller
+    const timer = setTimeout(() => controller.abort('timeout'), 35_000)
+    try {
+      const form = new FormData()
+      form.append('audio', audio, 'recording')
+      form.append('image', photos[0].file)
+      if (coords) { form.append('deviceLat', String(coords.lat)); form.append('deviceLng', String(coords.lng)) }
+      form.append('language', language)
+      if (incident) form.append('incident', incident)
+      const response = await fetch('/api/process-claim', { method: 'POST', body: form, signal: controller.signal })
+      const data: unknown = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(isRecord(data) && typeof data.error === 'string' ? data.error : `Analysis unavailable (${response.status}). Please retry.`)
+      if (!isRecord(data) || !Array.isArray(data.warnings) || !isRecord(data.gps)) throw new Error('The server response could not be read. Please retry.')
+      const result = normalizeAnalysis(data)
+      result.warnings = [...new Set([...result.warnings, ...data.warnings.filter((item): item is string => typeof item === 'string')])]
+      const gps = data.gps
+      if (validCoordinates(gps.lat, gps.lng) && typeof gps.lng === 'number' && ['exif', 'device', 'fallback'].includes(String(gps.source))) {
+        result.gps = { lat: gps.lat, lng: gps.lng, source: gps.source === 'exif' ? 'exif' : gps.source === 'device' ? 'device' : 'fallback', label: typeof gps.label === 'string' ? gps.label : 'Location not verified' }
+      }
+      result.photo_timestamp = typeof data.photo_timestamp === 'string' && Number.isFinite(Date.parse(data.photo_timestamp)) ? data.photo_timestamp : null
+      if (!controller.signal.aborted) setAnalysis(result)
+    } catch (cause) {
+      if (!controller.signal.aborted || controller.signal.reason === 'timeout') {
+        setError(controller.signal.aborted ? 'Analysis timed out. Please retry; your inputs are kept.' : cause instanceof Error ? cause.message : 'Network unavailable. Please retry; your inputs are kept.')
+      }
+    } finally { clearTimeout(timer); pending.current = false; setLoading(false) }
+  }
 
   async function download() {
-    setGenerating(true); setMessage('Preparing your claim slip…')
+    if (!analysis || downloading.current) return
+    const currentRevision = revision.current
+    downloading.current = true; setGenerating(true); setMessage('Preparing your draft slip…')
     try {
-      // Embed the first uploaded field photo (if any) as a data URL.
       let imageDataUrl: string | null = null
-      if (photos.length > 0) {
-        try { imageDataUrl = await toDataUrl(photos[0].url) } catch { imageDataUrl = null }
+      let photoWarning = ''
+      if (photos[0]) {
+        try { imageDataUrl = await toDataUrl(photos[0].file) } catch { photoWarning = 'The photo could not be attached. Keep the original as evidence. ' }
       }
-      // Sample claim payload matching the /api/process-claim schema (Phase 2).
-      const input: ClaimSlipInput = {
-        claim: {
-          transcript: hindi,
-          translation: english,
-          crop: 'Paddy (Rice)',
-          calamity: 'Flood / Waterlogging',
-          damage_pct: 85,
-          hours_ago: 16,
-          summary: summaryEn,
-          summary_hi: summaryHi,
-        },
-        gps: coords,
-        imageDataUrl,
-      }
-      const doc = await generateClaimSlip(input)
-      doc.save('Kisan-Claim-Slip-72A.pdf')
-      setMessage('Your Kisan Claim Slip (Form 72A) has been downloaded as a PDF.')
-    } catch (err) {
-      console.error(err)
-      setMessage('Sorry, the claim slip could not be generated. Please try again.')
-    } finally {
-      setGenerating(false)
-    }
+      const result = await generateClaimSlip({ claim: analysis, imageDataUrl })
+      if (revision.current !== currentRevision) return
+      result.doc.save('Kisan-Claim-Slip-72A.pdf')
+      setMessage(photoWarning + 'Draft PDF download requested. ' + DRAFT_STATUS_EN + ' ' + result.warnings.join(' '))
+    } catch { setMessage('The draft PDF could not be generated. Please try again.') }
+    finally { downloading.current = false; setGenerating(false) }
   }
 
   return <Card className="preview-card [--card-spacing:--spacing(6)]">
-    <CardHeader><div className="mb-3 flex items-center justify-between"><span className="step-label">STEP 03</span><Badge variant="secondary"><Sparkles data-icon="inline-start" />Sample preview</Badge></div><CardTitle><h2>Your claim, made clear.</h2></CardTitle><CardDescription>A simple summary to help you take the next step.</CardDescription></CardHeader>
+    <CardHeader><div className="mb-3 flex items-center justify-between"><span className="step-label">STEP 03</span><Badge variant="secondary"><Sparkles data-icon="inline-start" />Draft preview</Badge></div><CardTitle><h2>Your claim, made clear.</h2></CardTitle><CardDescription>A draft to review before contacting your insurer.</CardDescription></CardHeader>
     <CardContent className="flex flex-col gap-5">
-      <div className="preview-status"><FileCheck2 className="size-4" /><span>Your voice. Your field. One claim slip.</span></div>
-      <div className="grid grid-cols-2 gap-4"><div className="detail-tile"><Wheat className="size-5" /><span>Detected crop</span><strong>Paddy (Rice)</strong></div><div className="detail-tile"><Waves className="size-5" /><span>Calamity type</span><strong>Flood / Waterlogging</strong></div></div>
-      <div className="flex items-start gap-3 rounded-lg border p-3"><MapPin className="mt-0.5 size-4 shrink-0 text-primary" /><div><p className="text-xs text-muted-foreground">Field location</p><p className="mt-1 text-sm font-medium">{location || 'Add your location in Step 2'}</p><p className="mt-1 text-[11px] text-muted-foreground">{location ? 'Device GPS · confirm this is your field' : 'GPS is shared only with your permission'}</p></div></div>
-      <div className="damage-box"><div className="flex items-center justify-between"><span className="text-sm font-medium">Estimated crop damage</span><Badge variant="outline">Severe loss</Badge></div><div className="my-3 flex items-baseline gap-1"><strong className="text-4xl font-semibold tracking-tight">85<span className="text-2xl">%</span></strong><span className="ml-2 text-xs text-muted-foreground">of the field affected</span></div><div role="meter" aria-label="Illustrative damage percentage" aria-valuenow={85} aria-valuemin={0} aria-valuemax={100} className="damage-track"><div /></div><div className="mt-2 flex justify-between text-[10px] text-muted-foreground"><span>0% · No damage</span><span>100% · Total loss</span></div></div>
-      <div><div className="mb-3 flex items-center justify-between"><h3 className="text-sm font-semibold">Your words, understood.</h3><span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Example transcript</span></div><div className="transcript"><span className="transcript-label">ORIGINAL · HINDI</span><p lang="hi" className="mt-2 text-sm leading-7">“{hindi}”</p><div className="my-3 border-t border-dashed" /><span className="transcript-label">ENGLISH TRANSLATION</span><p className="mt-2 text-xs leading-6 text-muted-foreground">“{english}”</p></div></div>
-      <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-1 rounded-lg border p-1" role="group" aria-label="Readback language">
-          <button type="button" onClick={() => setLang('hi')} disabled={!hindiAvailable} aria-pressed={lang === 'hi'} className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${lang === 'hi' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'} ${!hindiAvailable ? 'cursor-not-allowed opacity-50' : ''}`} lang="hi">हिंदी</button>
-          <button type="button" onClick={() => setLang('en')} aria-pressed={lang === 'en'} className={`flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${lang === 'en' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted'}`}>English</button>
+      <p className="text-xs text-muted-foreground">Preparing a draft sends your recording and the first photo to Google Gemini for analysis. Audio + photo: under 4 MB combined. Additional photos stay in this session; keep them for your insurer.</p>
+      <Button className="h-11 w-full" onClick={prepare} disabled={loading || !audio || !photos.length}>{loading ? <Loader2 className="animate-spin" /> : <Sparkles />}{loading ? 'Preparing draft…' : error ? 'Retry draft analysis' : 'Prepare draft intimation'}</Button>
+      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      {analysis && <>
+        <div className="preview-status"><FileCheck2 className="size-4" /><span>{DRAFT_STATUS_EN}<br /><span lang="hi">{DRAFT_STATUS_HI}</span></span></div>
+        <div className="grid grid-cols-2 gap-4"><div className="detail-tile"><Wheat className="size-5" /><span>Detected crop</span><strong>{analysis.crop_type}</strong></div><div className="detail-tile"><Waves className="size-5" /><span>Calamity type</span><strong>{analysis.damage_cause}</strong></div></div>
+        <div className="flex items-start gap-3 rounded-lg border p-3"><MapPin className="size-4 shrink-0" /><div><p className="text-xs">{analysis.gps.label}</p><p className="text-xs text-muted-foreground">{analysis.gps.lat !== null && analysis.gps.lng !== null ? `${analysis.gps.lat.toFixed(5)}, ${analysis.gps.lng.toFixed(5)}` : 'Not available'}</p></div></div>
+        <div className="damage-box"><span className="text-sm font-medium">Estimated crop damage · verify before filing</span><div className="my-3 text-4xl font-semibold">{analysis.damage_pct}%</div><div role="meter" aria-label="Estimated damage percentage" aria-valuenow={analysis.damage_pct} aria-valuemin={0} aria-valuemax={100} className="damage-track"><div style={{ width: `${analysis.damage_pct}%` }} /></div></div>
+        <div className="transcript"><span className="transcript-label">ORIGINAL</span><p lang={language} className="mt-2 text-sm leading-7 break-words">{analysis.transcript_original}</p><div className="my-3 border-t border-dashed" /><span className="transcript-label">ENGLISH TRANSLATION</span><p className="mt-2 text-xs leading-6 break-words">{analysis.transcript_en}</p></div>
+        <p lang="hi" className="text-sm leading-7">{analysis.summary_hi}</p><p className="text-xs leading-6">{analysis.summary_en}</p>
+        {analysis.warnings.length > 0 && <div role="status" className="rounded-lg border p-3 text-xs leading-6"><strong>Please review these details</strong><ul className="list-disc pl-4">{analysis.warnings.map((warning, i) => <li key={i}>{warning}</li>)}</ul></div>}
+        <div className="flex flex-col gap-2">
+          <div className="flex gap-2" role="group" aria-label="Readback language"><Button variant="outline" onClick={() => { cancel(); setLang('hi') }} aria-pressed={lang === 'hi'}>हिंदी</Button><Button variant="outline" onClick={() => { cancel(); setLang('en') }} aria-pressed={lang === 'en'}>English</Button></div>
+          <Button variant="outline" className="h-11 w-full" disabled={!supported} onClick={() => speak({ hi: `${DRAFT_STATUS_HI} ${analysis.summary_hi}`, en: `${DRAFT_STATUS_EN} ${analysis.summary_en}` }, lang)}>{speaking ? <Square /> : <Volume2 />}{speaking ? 'Stop' : needsTap ? 'Tap to listen' : lang === 'hi' ? 'Listen in Hindi · हिंदी में सुनें' : 'Listen in English'}</Button>
+          {supported && voicesReady && !hindiAvailable && <p className="text-xs text-muted-foreground">Hindi voice not installed on this device — English readback is available.</p>}
+          {!supported && <p className="text-xs text-muted-foreground">Speech playback is not supported on this device.</p>}
+          {notice && <p role="status" className="text-xs">{notice}</p>}
+          {usedFallback && <p role="status" className="text-xs">Playing the English summary instead.</p>}
         </div>
-        <Button variant="outline" className="h-11 w-full" onClick={() => speak({ hi: summaryHi, en: summaryEn }, lang)}>{speaking ? <Square data-icon="inline-start" /> : <Volume2 data-icon="inline-start" />}{speaking ? 'Stop' : lang === 'hi' ? 'Listen in Hindi' : 'Listen in English'}<span lang="hi">{lang === 'hi' && !speaking ? '· हिंदी में सुनें' : ''}</span></Button>
-        {!hindiAvailable && <p className="text-center text-[11px] leading-5 text-muted-foreground">Hindi voice not installed on this device — English readback is available.</p>}
-        {usedFallback && <p role="status" className="rounded-lg border border-border bg-muted/40 p-2 text-center text-[11px] leading-5 text-muted-foreground">No Hindi voice found — playing the English summary instead.</p>}
-      </div>
-      <div className="flex gap-2 text-[11px] leading-5 text-muted-foreground"><Info className="mt-0.5 size-3.5 shrink-0" /><p>Illustrative assessment only. Uploaded media is not automatically analysed. Your insurer must verify the actual loss.</p></div>
-      <Button className="h-12 w-full" onClick={download} disabled={generating}>{generating ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Download data-icon="inline-start" />}{generating ? 'Generating PDF…' : 'Download Kisan Claim Slip'}</Button>
-      <p className="-mt-2 text-center text-[11px] text-muted-foreground">Free to download · No claim has been submitted</p>
+        <div className="flex gap-2 text-xs leading-5"><Info className="size-4 shrink-0" /><p>AI-assisted draft only. Your insurer must verify the actual loss. {FILING_NEXT_STEP} {FILING_CONTACT_TODO && `Verified contact: ${FILING_CONTACT_TODO}`}</p></div>
+        <p lang="hi" className="text-xs">यह मसौदा अपनी बीमा कंपनी या आधिकारिक PMFBY पोर्टल पर जमा करें।</p>
+        <Button className="h-12 w-full" onClick={download} disabled={generating}>{generating ? <Loader2 className="animate-spin" /> : <Download />}{generating ? 'Generating PDF…' : 'Download draft claim slip'}</Button>
+      </>}
       {message && <p role="status" className="text-xs leading-5 text-primary">{message}</p>}
     </CardContent>
   </Card>

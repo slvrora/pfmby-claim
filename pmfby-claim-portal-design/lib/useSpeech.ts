@@ -1,112 +1,97 @@
 "use client"
 
-/**
- * useSpeech.ts
- * ------------
- * Small wrapper around the Web Speech API (window.speechSynthesis) used to read
- * the claim confirmation back to (often non-literate) farmers.
- *
- * Features:
- *  - Loads available voices and keeps them in sync via the `voiceschanged` event
- *    (Chrome populates the voice list asynchronously).
- *  - Speaks Hindi (`hi-IN`, rate 0.9) when a Hindi voice exists; otherwise falls
- *    back to English (`en-IN`) and reports that a fallback happened.
- *  - Exposes a speaking state + a toggle between Hindi and English readback.
- *  - Can auto-play the readback once when results load, but only if the browser
- *    actually allows it (we detect whether a usable voice is present).
- */
-
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { chooseVoice, speechChunks } from './speechUtils'
 
 export type SpeechLang = 'hi' | 'en'
 
-export interface UseSpeechResult {
-  /** Whether an utterance is currently being spoken. */
-  speaking: boolean
-  /** The language currently selected for readback. */
-  lang: SpeechLang
-  /** True when a Hindi (hi-IN) voice is available on this device. */
-  hindiAvailable: boolean
-  /** True when the last speak() call had to fall back to English. */
-  usedFallback: boolean
-  /** Speak the given text in the given language. Toggles off if already speaking. */
-  speak: (text: { hi: string; en: string }, lang: SpeechLang) => void
-  /** Switch the active readback language. */
-  setLang: (lang: SpeechLang) => void
-  /** Cancel any in-progress speech. */
-  cancel: () => void
+function synthesis(): SpeechSynthesis | null {
+  return typeof window !== 'undefined' && 'speechSynthesis' in window ? window.speechSynthesis : null
 }
 
-const HI_PREFIX = 'hi'
-
-function getSpeechSynthesis(): SpeechSynthesis | null {
-  if (typeof window === 'undefined') return null
-  return 'speechSynthesis' in window ? window.speechSynthesis : null
-}
-
-export function useSpeech(): UseSpeechResult {
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([])
-  const [speaking, setSpeaking] = useState(false)
+export function useSpeech() {
+  const [supported, setSupported] = useState(false)
+  const [voicesReady, setVoicesReady] = useState(false)
+  const [hindiAvailable, setHindiAvailable] = useState(false)
+  const [isSpeaking, setIsSpeaking] = useState(false)
   const [lang, setLang] = useState<SpeechLang>('hi')
   const [usedFallback, setUsedFallback] = useState(false)
-  const synth = getSpeechSynthesis()
-
-  // Load voices and keep them in sync (Chrome loads them asynchronously).
-  useEffect(() => {
-    if (!synth) return
-    const load = () => setVoices(synth.getVoices())
-    load()
-    synth.addEventListener('voiceschanged', load)
-    return () => synth.removeEventListener('voiceschanged', load)
-  }, [synth])
-
-  // Cancel any pending speech when the component using the hook unmounts.
-  useEffect(() => {
-    if (!synth) return
-    return () => synth.cancel()
-  }, [synth])
-
-  const hindiAvailable = voices.some((v) => v.lang?.toLowerCase().startsWith(HI_PREFIX))
+  const [notice, setNotice] = useState('')
+  const [needsTap, setNeedsTap] = useState(false)
+  const voices = useRef<SpeechSynthesisVoice[]>([])
+  const utterance = useRef<SpeechSynthesisUtterance | null>(null)
+  const run = useRef(0)
+  const active = useRef(false)
 
   const cancel = useCallback(() => {
-    synth?.cancel()
-    setSpeaking(false)
-  }, [synth])
+    run.current++
+    active.current = false
+    utterance.current = null
+    synthesis()?.cancel()
+    setIsSpeaking(false)
+  }, [])
 
-  const speak = useCallback(
-    (text: { hi: string; en: string }, target: SpeechLang) => {
-      if (!synth) return
+  useEffect(() => {
+    const synth = synthesis()
+    setSupported(Boolean(synth) && typeof SpeechSynthesisUtterance !== 'undefined')
+    if (!synth) return
+    const loadVoices = () => {
+      voices.current = synth.getVoices()
+      setHindiAvailable(voices.current.some(v => v.lang.toLowerCase().replace(/_/g, '-').startsWith('hi')))
+      if (voices.current.length) setVoicesReady(true)
+    }
+    loadVoices()
+    synth.addEventListener('voiceschanged', loadVoices)
+    const timer = setTimeout(() => { loadVoices(); setVoicesReady(true) }, 1800)
+    window.addEventListener('pagehide', cancel)
+    window.addEventListener('beforeunload', cancel)
+    return () => {
+      clearTimeout(timer)
+      synth.removeEventListener('voiceschanged', loadVoices)
+      window.removeEventListener('pagehide', cancel)
+      window.removeEventListener('beforeunload', cancel)
+      run.current++; active.current = false; utterance.current = null; synth.cancel()
+    }
+  }, [cancel])
 
-      // Clicking again while speaking cancels playback (toggle behaviour).
-      if (speaking) {
-        synth.cancel()
-        setSpeaking(false)
-        return
+  const speak = useCallback((text: { hi: string; en: string }, target: SpeechLang) => {
+    const synth = synthesis()
+    if (!synth || typeof SpeechSynthesisUtterance === 'undefined') return
+    if (active.current) { cancel(); return }
+    cancel()
+    // No pending speech is scheduled while voices load: a user gesture starts immediately.
+    voices.current = synth.getVoices()
+    const hasHindi = voices.current.some(v => v.lang.toLowerCase().replace(/_/g, '-').startsWith('hi'))
+    const effective = target === 'hi' && !hasHindi ? 'en' : target
+    setUsedFallback(target === 'hi' && !hasHindi)
+    setHindiAvailable(hasHindi)
+    setNotice(''); setNeedsTap(false)
+    const chunks = speechChunks(effective === 'hi' ? text.hi : text.en)
+    if (!chunks.length) return
+    const voice = chooseVoice(voices.current, target)
+    const id = run.current
+    active.current = true
+    const next = (index: number) => {
+      if (run.current !== id || !active.current) return
+      if (index >= chunks.length) { active.current = false; utterance.current = null; setIsSpeaking(false); return }
+      const current = new SpeechSynthesisUtterance(chunks[index])
+      utterance.current = current
+      current.lang = effective === 'hi' ? 'hi-IN' : 'en-IN'
+      current.rate = 0.9
+      if (voice) current.voice = voice
+      current.onstart = () => { if (run.current === id && utterance.current === current) setIsSpeaking(true) }
+      current.onend = () => { if (run.current === id && utterance.current === current) next(index + 1) }
+      current.onerror = event => {
+        if (run.current !== id || utterance.current !== current) return
+        active.current = false; utterance.current = null; setIsSpeaking(false)
+        if (event.error === 'not-allowed') { setNeedsTap(true); setNotice('Playback was blocked. Tap to listen.') }
+        else if (!['interrupted', 'canceled'].includes(event.error)) setNotice('Audio playback is unavailable. You can read the summary or try again.')
       }
+      try { synth.cancel(); synth.speak(current) }
+      catch { active.current = false; utterance.current = null; setIsSpeaking(false); setNotice('Audio playback is unavailable on this device.') }
+    }
+    next(0)
+  }, [cancel])
 
-      const wantHindi = target === 'hi'
-      const hasHindi = voices.some((v) => v.lang?.toLowerCase().startsWith(HI_PREFIX))
-
-      // Fall back to English when Hindi is requested but unavailable.
-      const effectiveLang: SpeechLang = wantHindi && !hasHindi ? 'en' : target
-      setUsedFallback(wantHindi && !hasHindi)
-
-      const utterance = new SpeechSynthesisUtterance(effectiveLang === 'hi' ? text.hi : text.en)
-      utterance.lang = effectiveLang === 'hi' ? 'hi-IN' : 'en-IN'
-      utterance.rate = 0.9
-
-      const voice = voices.find((v) => v.lang?.toLowerCase().startsWith(effectiveLang === 'hi' ? HI_PREFIX : 'en'))
-      if (voice) utterance.voice = voice
-
-      utterance.onend = () => setSpeaking(false)
-      utterance.onerror = () => setSpeaking(false)
-
-      synth.cancel()
-      synth.speak(utterance)
-      setSpeaking(true)
-    },
-    [synth, speaking, voices],
-  )
-
-  return { speaking, lang, hindiAvailable, usedFallback, speak, setLang, cancel }
+  return { speaking: isSpeaking, supported, voicesReady, lang, hindiAvailable, usedFallback, notice, needsTap, speak, setLang, cancel }
 }
